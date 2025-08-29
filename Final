@@ -1,0 +1,515 @@
+
+#include "Ifx_Types.h"
+#include "IfxCpu.h"
+#include "IfxScuWdt.h"
+
+#include "IfxPort.h"
+#include "IfxPort_PinMap.h"
+
+#include "Driver_Stm.h"
+#include "Platform_Types.h"
+
+#include "Driver_Adc.h"
+
+#include "pwm.h"
+#include "Bsp.h"
+
+uint32_t adcResult = 0;
+// 변환에 10ms 필요
+
+// GPIO related
+#define PCn_2_IDX 19
+#define P2_IDX 2
+#define PCn_1_IDX 11
+#define P1_IDX 1
+
+// main.c
+#include "asclin.h"
+
+// GPIO related
+#define PCn_2_IDX 19
+#define P2_IDX 2
+#define PCn_1_IDX 11
+#define P1_IDX 1
+
+// ERU related
+#define EXIS0_IDX 4
+#define FEN0_IDX 8
+#define EIEN0_IDX 11
+#define INP0_IDX 12
+#define IGP0_IDX 14
+
+// SRC related
+#define SRE_IDX 10
+#define TOS_IDX 11
+
+// segments
+#define SCLK IfxPort_P00_1
+#define RCLK IfxPort_P00_2
+#define DIO IfxPort_P00_3
+
+typedef struct
+{
+    uint32_t u32nuCnt1ms;
+    uint32_t u32nuCnt10ms;
+    uint32_t u32nuCnt100ms;
+    uint32_t u32nuCnt1000ms;
+
+} TestCnt;
+
+uint32 IR0_Result = 0;
+uint32 IR1_Result = 0;
+uint32 IR2_Result = 0;
+
+uint8_t _LED_0F[10] = {0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90};
+                        // 1100 0000
+// Task scheduling related
+void AppScheduling(void);
+void AppTask1ms(void);
+void AppTask10ms(void);
+void AppTask100ms(void);
+void AppTask1000ms(void);
+
+IfxCpu_syncEvent g_cpuSyncEvent = 0;
+IfxCpu_syncEvent cpuSyncEvent = 0;
+
+/***********************************************************************/
+/*Variable*/
+/***********************************************************************/
+TestCnt stTestCnt;
+
+/* IR Sensor Variable */
+int stop_movement = 0;
+int IR_Sensor[3] = {0, 0, 0};
+/* PreDefine Functions */
+void initGPIO(void);
+void initERU(void);
+void send(uint8_t X);
+void send_port(uint8_t X, uint8_t port);
+void LCD_Control(void);
+void LCD_Print(int *n1, int *n2, int *n3, int *n4);
+void LCD_NUM_Convert(int *value, int *n1, int *n2, int *n3, int *n4);
+void CDS_Control_LED(void);
+void makeSound(unsigned int soundIdx);
+void IR_Display(void);
+void IR_Check(void);
+
+void Control_Motor(void);
+
+IfxCpu_syncEvent cpuSyncEvent;
+
+
+#define STM_CLOCK_HZ 1000000U
+
+volatile uint32_t ultraStartTime = 0;
+volatile uint32_t ultraEndTime   = 0;
+volatile uint8_t  ultraFlag      = 0; // 0: idle, 1: waiting for echo rising, 2: measuring
+typedef float float32_t;
+
+float32_t fUltraDistance = 0.0f;
+
+//GPIO related
+#define PCn_0_IDX 3
+#define P0_IDX 0
+#define PCn_1_IDX 11
+#define P1_IDX 1
+#define PCn_2_IDX 19
+#define P2_IDX 2
+
+
+#define TRIG IfxPort_P00_8
+#define ECHO IfxPort_P02_1
+
+// ERU related
+#define EXIS0_IDX 4 // 감지할 입력 신호 선택
+#define FEN0_IDX 8 // 하강 엣지 감지 설정
+#define REN0_IDX 9 // 상승 엣지 감지 설정
+#define LDEN0_IDX 10
+#define EIEN0_IDX 11
+#define INP0_IDX 12  // 인터럽트 요청 라인 연결
+#define IGP0_IDX 14
+#define IGP1_IDX 30
+
+#define FENO_IDX1 24
+#define RENO_IDX1 25
+#define EIENO_IDX1 27
+#define INP1_IDX 28
+
+// SRC related
+#define SRE_IDX 10
+#define TOS_IDX 11
+
+#define WAIT_TIME 10
+
+int fDistance = 0;
+
+void delay()
+{
+    volatile int a = 0;
+
+    for (int i; i < 1000000; i++)
+    {
+        a += 1;
+    }
+}
+void UltraTrigger(void);
+void UltraEchoISR(void);
+
+void Emotion_LCD_Print(void);
+IFX_INTERRUPT(UltraEchoISR,0,0x10); // 0x10이 발생했을 때 ISR0를 실행한다.
+
+void UltraEchoISR(void)
+{
+    uint32_t currentTime = STM0_TIM0.U;
+//    kkk = 100;
+    if(ultraFlag == 1) // 상승 엣지
+    {
+        ultraStartTime = currentTime;
+        ultraFlag = 2;
+    }
+    else if(ultraFlag == 2) // 하강 엣지
+    {
+        ultraEndTime = currentTime;
+        fUltraDistance = (((float32_t)(ultraEndTime - ultraStartTime) / STM_CLOCK_HZ) / 2.0f) * 340.0f; // cm
+       if(fUltraDistance < 10)
+       {
+           fDistance = 1;
+       }
+        ultraFlag = 0; // 측정 완료
+    }
+
+}
+int core0_main(void)
+{
+    IfxCpu_enableInterrupts();
+
+    /* !!WATCHDOG0 AND SAFETY WATCHDOG ARE DISABLED HERE!!
+     * Enable the watchdogs and service them periodically if it is required
+     */
+    IfxScuWdt_disableCpuWatchdog(IfxScuWdt_getCpuWatchdogPassword());
+    IfxScuWdt_disableSafetyWatchdog(IfxScuWdt_getSafetyWatchdogPassword());
+
+    /* Wait for CPU sync event */
+    IfxCpu_emitEvent(&cpuSyncEvent);
+    IfxCpu_waitEvent(&cpuSyncEvent, 1);
+
+    Driver_Stm_Init();
+    Driver_Adc_Init();
+
+    Driver_IR_init();
+    /* Initialize a time variable */
+    // Ifx_TickTime ticksFor10ms = IfxStm_getTicksFromMilliseconds(BSP_DEFAULT_TIMER, WAIT_TIME);
+
+    /* Initialize GTM TOM module */
+
+    initGPIO();
+    Driver_Stm_Init();
+    Driver_Adc_Init();
+    init_ASCLIN_UART(); // init uart
+
+
+    Driver_Stm_Init();
+    initERU();
+
+
+    P00_IOCR0.U = 0x80808000;
+    /* Initialize a time variable */
+    Ifx_TickTime ticksFor10ms = IfxStm_getTicksFromMilliseconds(BSP_DEFAULT_TIMER, WAIT_TIME);
+    Ifx_TickTime ticksFor1000ms = IfxStm_getTicksFromMilliseconds(BSP_DEFAULT_TIMER, 1000);
+
+    initMotor();
+
+    motor_stop(INDEX_FL);
+    motor_stop(INDEX_FR);
+
+    while (1)
+    {
+        AppScheduling();
+        IR_Check();
+        if(fDistance == 0)
+        {
+            Control_Motor();
+        }
+        else
+        {
+            motor_stop(INDEX_FL);
+            motor_stop(INDEX_FR);
+        }
+    }
+    return (1);
+}
+void Control_Motor(void)
+{
+    // 검정색 = 1
+    int normal_power = 70;   // 전진 속도
+    int turn_power = 80;     // 좌/우 회전 시, 사용하는 속도
+    int powerful_right = 45; // 우측 바퀴가 힘이 세서, 억제하기 위한 변수.
+    if (IR_Sensor[0] == 1 && IR_Sensor[1] == 1 && IR_Sensor[2] == 1)
+    {
+        motor_stop(INDEX_FL);
+        motor_stop(INDEX_FR);
+    }
+    else if (IR_Sensor[0] == 0 && IR_Sensor[1] == 1 && IR_Sensor[2] == 1) // Right
+    {
+
+        set_motor_power(INDEX_FL, turn_power + 15);
+        set_motor_power(INDEX_FR, turn_power - powerful_right + 20);
+
+        motor_go(INDEX_FL);
+        motor_go(INDEX_FR);
+
+        set_motor_dir(INDEX_FL, BACKWARD);
+        set_motor_dir(INDEX_FR, FORWARD);
+    }
+    else if (IR_Sensor[0] == 0 && IR_Sensor[1] == 0 && IR_Sensor[2] == 1) // Right 2
+    {
+
+        set_motor_power(INDEX_FL, turn_power + 15);
+        set_motor_power(INDEX_FR, turn_power - powerful_right + 20);
+
+        motor_go(INDEX_FL);
+        motor_go(INDEX_FR);
+
+        set_motor_dir(INDEX_FL, BACKWARD);
+        set_motor_dir(INDEX_FR, FORWARD);
+    }
+    else if (IR_Sensor[0] == 1 && IR_Sensor[1] == 1 && IR_Sensor[2] == 0) // Left 1
+    {
+
+        set_motor_power(INDEX_FL, turn_power);
+        set_motor_power(INDEX_FR, turn_power - powerful_right);
+
+        motor_go(INDEX_FL);
+        motor_go(INDEX_FR);
+
+        set_motor_dir(INDEX_FL, FORWARD);
+        set_motor_dir(INDEX_FR, BACKWARD);
+    }
+    else if (IR_Sensor[0] == 1 && IR_Sensor[1] == 0 && IR_Sensor[2] == 0) // Left 2
+    {
+
+        set_motor_power(INDEX_FL, turn_power);
+        set_motor_power(INDEX_FR, turn_power - powerful_right);
+
+        motor_go(INDEX_FL);
+        motor_go(INDEX_FR);
+
+        set_motor_dir(INDEX_FL, FORWARD);
+        set_motor_dir(INDEX_FR, BACKWARD);
+    }
+    else
+    {
+        set_motor_power(INDEX_FL, 70);
+        set_motor_power(INDEX_FR, 25);
+
+        motor_go(INDEX_FL);
+        motor_go(INDEX_FR);
+
+        set_motor_dir(INDEX_FL, BACKWARD);
+        set_motor_dir(INDEX_FR, BACKWARD);
+    }
+}
+void IR_Check(void)
+{
+    if ((P00_IN.U & 0x1 << 5) == 0)
+        IR_Sensor[0] = 0;
+    else
+        IR_Sensor[0] = 1;
+
+    if ((P00_IN.U & 0x1 << 6) == 0)
+        IR_Sensor[1] = 0;
+    else
+        IR_Sensor[1] = 1;
+
+    if ((P00_IN.U & 0x1 << 7) == 0)
+        IR_Sensor[2] = 0;
+    else
+        IR_Sensor[2] = 1;
+
+    int zero = 0;
+    int ir0 = 1, ir1 = 1, ir2 = 1;
+    if ((P00_IN.U & 0x1 << 5) == 0)
+        ir0 = 0;
+
+    if ((P00_IN.U & 0x1 << 6) == 0)
+        ir1 = 0;
+
+    if ((P00_IN.U & 0x1 << 7) == 0)
+        ir2 = 0;
+
+//    LCD_Print(&ir0, &ir1, &ir2, &zero);
+
+    Emotion_LCD_Print();
+    if (ir0 == 1 && ir1 == 1 && ir2 == 1)
+        stop_movement = 1;
+    print("%d,     %d,     %d" ENDLINE, ir0, ir1, ir2);
+}
+void LCD_Control(void)
+{
+    int n1, n2, n3, n4;
+    LCD_NUM_Convert(&IR0_Result, &n1, &n2, &n3, &n4);
+    LCD_Print(&n1, &n2, &n3, &n4);
+}
+void LCD_NUM_Convert(int *value, int *n1, int *n2, int *n3, int *n4)
+{
+    *n1 = (int)(*value) % 10;
+    *n2 = (int)((*value) % 100) / 10;
+    *n3 = (int)((*value) % 1000) / 100;
+    *n4 = (int)((*value) % 10000) / 1000;
+}
+void LCD_Print(int *n1, int *n2, int *n3, int *n4)
+{
+    for (int i = 0; i < 100; i++)
+    {
+        send_port(_LED_0F[*n1], 0x1);
+        send_port(_LED_0F[*n2], 0x2);
+        send_port(_LED_0F[*n3], 0x4);
+        send_port(_LED_0F[*n4], 0x8);
+    }
+}
+void Emotion_LCD_Print(void)
+{
+    for (int i = 0; i < 100; i++)
+    {   
+//                send_port(0xDC, 0x1);
+//                send_port(0xF3, 0x2);
+//                send_port(0xE7, 0x4);
+//                send_port(0xDC, 0x8);
+                send_port(0xA1, 0x1);
+                send_port(0xA3, 0x2);
+                send_port(0xA3, 0x4);
+                send_port(0x90, 0x8);
+    }
+}
+
+void initGPIO(void)
+{
+    // IR Sensor p00.5~p007
+    P00_IOCR4.U &= ~(0x1F << 27); // p00.7
+    P00_IOCR4.U |= 0xEF << 27;
+
+    P00_IOCR4.U &= ~(0x1F << 19); // p00.6
+    P00_IOCR4.U |= 0xEF << 19;
+
+    P00_IOCR4.U &= ~(0x1F << 11); // 000.5
+    P00_IOCR4.U |= 0xEF << 11;
+
+
+    IfxPort_setPinModeOutput(TRIG.port, TRIG.pinIndex, IfxPort_OutputMode_pushPull, IfxPort_OutputIdx_general);    // 초음파센서 Trig핀 output mode로 설정
+    IfxPort_setPinLow(TRIG.port, TRIG.pinIndex);
+    IfxPort_setPinModeInput(ECHO.port, ECHO.pinIndex, IfxPort_InputMode_pullDown);    // 초음파센서 Echo핀 input mode로 설정
+}
+void AppTask1ms(void)
+{
+    stTestCnt.u32nuCnt1ms++;
+}
+
+void AppTask10ms(void)
+{
+    stTestCnt.u32nuCnt10ms++;
+}
+
+void AppTask100ms(void)
+{
+
+    stTestCnt.u32nuCnt100ms++;
+    UltraTrigger();
+}
+
+void AppTask1000ms(void)
+{
+
+    stTestCnt.u32nuCnt1000ms++;
+}
+void AppTask10s(void)
+{
+}
+
+void AppScheduling(void)
+{
+    if (stSchedulingInfo.u8nuScheduling1msFlag == 1u)
+    {
+        stSchedulingInfo.u8nuScheduling1msFlag = 0u;
+        AppTask1ms();
+
+        if (stSchedulingInfo.u8nuScheduling10msFlag == 1u)
+        {
+            stSchedulingInfo.u8nuScheduling10msFlag = 0u;
+            AppTask10ms();
+        }
+
+        if (stSchedulingInfo.u8nuScheduling100msFlag == 1u)
+        {
+            stSchedulingInfo.u8nuScheduling100msFlag = 0u;
+            AppTask100ms();
+        }
+        if (stSchedulingInfo.u8nuScheduling1000msFlag == 1u)
+        {
+            stSchedulingInfo.u8nuScheduling1000msFlag = 0u;
+            AppTask1000ms();
+        }
+    }
+}
+
+void send(uint8_t X)
+{
+    for (int i = 8; i >= 1; i--)
+    {
+        if (X & 0x80)
+        {
+            IfxPort_setPinHigh(DIO.port, DIO.pinIndex);
+        }
+        else
+        {
+            IfxPort_setPinLow(DIO.port, DIO.pinIndex);
+        }
+        X <<= 1;
+        IfxPort_setPinLow(SCLK.port, SCLK.pinIndex);
+        IfxPort_setPinHigh(SCLK.port, SCLK.pinIndex);
+    }
+}
+void send_port(uint8_t X, uint8_t port)
+{
+    send(X);
+    send(port);
+    IfxPort_setPinLow(RCLK.port, RCLK.pinIndex);
+    IfxPort_setPinHigh(RCLK.port, RCLK.pinIndex);
+}
+
+void initERU (void) {
+    //EICR 설정(설정) -> OGU 설정(전달) ->  IGCR 값 설정(IOUT으로 전달하기 위해) -> SRC_SCU_SCU_ERU 설정
+    SCU_EICR1.U &= ~(0x7 << EXIS0_IDX);
+    SCU_EICR1.U |= 0x1 << EXIS0_IDX;
+
+    SCU_EICR1.U |= 1 << FEN0_IDX;
+    SCU_EICR1.U |= 1 << REN0_IDX;
+    SCU_EICR1.U |= 1 << EIEN0_IDX;
+
+    SCU_EICR1.U &= ~(0x7 << INP0_IDX);
+    SCU_IGCR0.U &= ~(0x3 << IGP0_IDX);
+    SCU_IGCR0.U |= 0x1 << IGP0_IDX;
+
+    SRC_SCU_SCU_ERU0.U &= ~0xFF;
+    SRC_SCU_SCU_ERU0.U |= 0x10;
+    SRC_SCU_SCU_ERU0.U |= 1 << SRE_IDX;
+    SRC_SCU_SCU_ERU0.U &= ~(0x3 << TOS_IDX);
+}
+
+void UltraTrigger(void)
+{
+    IfxPort_setPinLow(TRIG.port, TRIG.pinIndex);
+    waitTime(300);
+    IfxPort_setPinHigh(TRIG.port, TRIG.pinIndex);
+    waitTime(1000);
+    IfxPort_setPinLow(TRIG.port, TRIG.pinIndex);
+    ultraFlag = 1; // 다음 ECHO 상승 엣지 기다림
+//    while(!IfxPort_getPinState(ECHO.port, ECHO.pinIndex)){
+//        P10_OUT.U = 0x0;
+//    }
+//
+//    if(IfxPort_getPinState(ECHO.port, ECHO.pinIndex)){
+//        P10_OUT.U = 0x4;
+//    }
+}
+
+
